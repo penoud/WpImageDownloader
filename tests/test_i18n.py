@@ -1,0 +1,151 @@
+"""Tests for `Glaneur.i18n`."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
+
+from Glaneur import i18n
+
+
+@pytest.fixture(autouse=True)
+def _reset_translator():
+    """Ensure the module-level translator does not leak between tests."""
+    i18n._translator = None
+    yield
+    i18n._translator = None
+
+
+@pytest.fixture
+def qapp():
+    """Provide a `QApplication` — required by `installTranslator` and
+    aligned with pytest-qt's expectations."""
+    return QApplication.instance() or QApplication([])
+
+
+# --------------------------------------------------------------------------- #
+# dossier_traductions
+# --------------------------------------------------------------------------- #
+
+
+class TestDossierTraductions:
+    def test_dev_renvoie_le_dossier_a_cote_du_paquet(self):
+        # No `_MEIPASS`: fall back to `<repo>/translations`.
+        # It exists in the repo, so the function returns that path.
+        d = i18n.dossier_traductions()
+        assert d.is_dir()
+        assert d.name == "translations"
+
+    def test_meipass_est_prioritaire_si_le_dossier_existe(
+        self, tmp_path, monkeypatch,
+    ):
+        # Simulate a PyInstaller bundle by setting `sys._MEIPASS` to a
+        # temporary directory that contains a `translations/` folder.
+        bundle = tmp_path / "bundle"
+        (bundle / "translations").mkdir(parents=True)
+        monkeypatch.setattr(sys, "_MEIPASS", str(bundle), raising=False)
+        assert i18n.dossier_traductions() == bundle / "translations"
+
+    def test_meipass_absent_replie_sur_le_paquet(self, monkeypatch):
+        # If `_MEIPASS` exists but points nowhere, the second candidate
+        # (repo root) still wins.
+        monkeypatch.setattr(
+            sys, "_MEIPASS", "/nonexistent-meipass-xxx", raising=False,
+        )
+        d = i18n.dossier_traductions()
+        assert d.is_dir()
+        assert d.name == "translations"
+
+    def test_dernier_recours_renvoie_le_chemin_theorique(self, monkeypatch):
+        # Neither candidate exists on disk: the function still returns
+        # the theoretical package-adjacent path so the caller sees a
+        # coherent (if empty) directory.
+        monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+        with patch.object(Path, "is_dir", return_value=False):
+            d = i18n.dossier_traductions()
+        assert d.name == "translations"
+
+
+# --------------------------------------------------------------------------- #
+# resoudre_langue
+# --------------------------------------------------------------------------- #
+
+
+class TestResoudreLangue:
+    def test_langue_configuree_prime(self):
+        assert i18n.resoudre_langue("en") == "en"
+        assert i18n.resoudre_langue("fr") == "fr"
+        # Any non-empty configured value is returned as-is; validation
+        # happens later in `installer_traducteur`.
+        assert i18n.resoudre_langue("zz") == "zz"
+
+    def test_vide_utilise_la_locale_systeme(self, monkeypatch):
+        faux_locale = MagicMock()
+        faux_locale.name.return_value = "fr_CH"
+        monkeypatch.setattr(
+            "Glaneur.i18n.QLocale.system", staticmethod(lambda: faux_locale),
+        )
+        assert i18n.resoudre_langue("") == "fr"
+
+    def test_locale_systeme_sans_underscore(self, monkeypatch):
+        faux_locale = MagicMock()
+        faux_locale.name.return_value = "en"
+        monkeypatch.setattr(
+            "Glaneur.i18n.QLocale.system", staticmethod(lambda: faux_locale),
+        )
+        assert i18n.resoudre_langue("") == "en"
+
+    def test_dernier_recours_est_fr(self, monkeypatch):
+        # `QLocale.system().name()` returning an empty string leads to
+        # the `or "fr"` fallback.
+        faux_locale = MagicMock()
+        faux_locale.name.return_value = ""
+        monkeypatch.setattr(
+            "Glaneur.i18n.QLocale.system", staticmethod(lambda: faux_locale),
+        )
+        assert i18n.resoudre_langue("") == "fr"
+
+
+# --------------------------------------------------------------------------- #
+# installer_traducteur
+# --------------------------------------------------------------------------- #
+
+
+class TestInstallerTraducteur:
+    def test_fr_ne_charge_rien(self, qapp):
+        app = MagicMock(spec=QCoreApplication)
+        assert i18n.installer_traducteur(app, "fr") == "fr"
+        app.installTranslator.assert_not_called()
+        assert i18n._translator is None
+
+    def test_en_charge_le_qm_reel(self, qapp):
+        # `translations/glaneur_en.qm` ships in the repo — load it end
+        # to end, then confirm the translator was installed.
+        app = MagicMock(spec=QCoreApplication)
+        assert i18n.installer_traducteur(app, "en") == "en"
+        app.installTranslator.assert_called_once()
+        assert i18n._translator is not None
+
+    def test_langue_inconnue_replie_sur_fr(self, qapp):
+        app = MagicMock(spec=QCoreApplication)
+        # `zz` has no `.qm`: fall back to French and clear the
+        # module-level translator.
+        assert i18n.installer_traducteur(app, "zz") == "fr"
+        app.installTranslator.assert_not_called()
+        assert i18n._translator is None
+
+    def test_langue_vide_deleguee_a_resoudre(self, qapp, monkeypatch):
+        # An empty configured language reads the system locale.
+        faux_locale = MagicMock()
+        faux_locale.name.return_value = "fr_FR"
+        monkeypatch.setattr(
+            "Glaneur.i18n.QLocale.system", staticmethod(lambda: faux_locale),
+        )
+        app = MagicMock(spec=QCoreApplication)
+        assert i18n.installer_traducteur(app) == "fr"
+        app.installTranslator.assert_not_called()
